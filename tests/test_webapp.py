@@ -143,6 +143,181 @@ def test_job_history_filters_by_ticker_and_status(client):
     assert [j["id"] for j in res.json()] == ["j-tsla"]
 
 
+def test_chart_returns_price_series(client):
+    import pandas as pd
+
+    from webapp.backend import charts
+
+    key = _signup(client)
+
+    class FakeTicker:
+        def __init__(self, symbol):
+            pass
+
+        def history(self, period):
+            idx = pd.to_datetime(["2024-05-08", "2024-05-09", "2024-05-10"])
+            return pd.DataFrame({"Close": [100.0, 101.5, 99.25]}, index=idx)
+
+    with patch.object(charts.yf, "Ticker", FakeTicker):
+        res = client.get("/api/chart/nvda", headers={"X-API-Key": key}, params={"range": "1mo"})
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ticker"] == "NVDA"
+    assert body["range"] == "1mo"
+    assert body["points"] == [
+        {"date": "2024-05-08", "close": 100.0},
+        {"date": "2024-05-09", "close": 101.5},
+        {"date": "2024-05-10", "close": 99.25},
+    ]
+
+
+def test_chart_rejects_invalid_range(client):
+    key = _signup(client)
+    res = client.get("/api/chart/NVDA", headers={"X-API-Key": key}, params={"range": "not-a-range"})
+    assert res.status_code == 422
+
+
+def test_chart_502_when_ticker_has_no_data(client):
+    from webapp.backend import charts
+
+    key = _signup(client)
+
+    class EmptyTicker:
+        def __init__(self, symbol):
+            pass
+
+        def history(self, period):
+            import pandas as pd
+
+            return pd.DataFrame()
+
+    with patch.object(charts.yf, "Ticker", EmptyTicker):
+        res = client.get("/api/chart/ZZZZ", headers={"X-API-Key": key})
+
+    assert res.status_code == 502
+
+
+def test_me_defaults_to_usd(client):
+    key = _signup(client)
+    res = client.get("/api/me", headers={"X-API-Key": key})
+    assert res.json()["currency"] == "USD"
+
+
+def test_me_includes_lifetime_stats(client):
+    from webapp.backend import database
+
+    key = _signup(client)
+    user = database.get_user_by_api_key(key)
+
+    database.create_job("j1", user["id"], "NVDA", "2024-01-01")
+    database.update_job("j1", status="done", decision="BUY", finished_at="x")
+    database.create_job("j2", user["id"], "NVDA", "2024-01-02")
+    database.update_job("j2", status="done", decision="BUY", cached=1, finished_at="x")
+    database.create_job("j3", user["id"], "TSLA", "2024-01-01")
+    database.update_job("j3", status="failed", error="boom", finished_at="x")
+    database.add_watchlist_ticker(user["id"], "AAPL")
+    database.add_watchlist_ticker(user["id"], "MSFT")
+
+    res = client.get("/api/me", headers={"X-API-Key": key})
+    body = res.json()
+    assert body["total_jobs"] == 3
+    assert body["done_jobs"] == 2
+    assert body["cached_jobs"] == 1
+    assert body["distinct_tickers"] == 2
+    assert body["watchlist_count"] == 2
+
+
+def test_me_stats_zero_for_new_user(client):
+    key = _signup(client)
+    res = client.get("/api/me", headers={"X-API-Key": key})
+    body = res.json()
+    assert body["total_jobs"] == 0
+    assert body["done_jobs"] == 0
+    assert body["cached_jobs"] == 0
+    assert body["distinct_tickers"] == 0
+    assert body["watchlist_count"] == 0
+
+
+def test_update_profile_sets_currency(client):
+    key = _signup(client)
+    res = client.patch("/api/me", headers={"X-API-Key": key}, json={"currency": "eur"})
+    assert res.status_code == 200
+    assert res.json()["currency"] == "EUR"
+
+    res = client.get("/api/me", headers={"X-API-Key": key})
+    assert res.json()["currency"] == "EUR"
+
+
+def test_update_profile_rejects_unsupported_currency(client):
+    key = _signup(client)
+    res = client.patch("/api/me", headers={"X-API-Key": key}, json={"currency": "XYZ"})
+    assert res.status_code == 422
+
+
+def test_update_profile_currency_does_not_clobber_display_name(client):
+    """A PATCH that only sends `currency` must not wipe an existing
+    display_name (regression: the handler used to unconditionally rewrite
+    display_name on every PATCH, defaulting it to null)."""
+    key = _signup(client)
+    client.patch("/api/me", headers={"X-API-Key": key}, json={"display_name": "Ada"})
+    res = client.patch("/api/me", headers={"X-API-Key": key}, json={"currency": "GBP"})
+    assert res.status_code == 200
+    assert res.json()["display_name"] == "Ada"
+    assert res.json()["currency"] == "GBP"
+
+
+def test_rates_board_for_base_currency(client):
+    import pandas as pd
+
+    from webapp.backend import rates
+
+    key = _signup(client)
+
+    class FakeTicker:
+        def __init__(self, symbol):
+            self.symbol = symbol
+
+        def history(self, period):
+            # Deterministic "rate" derived from the ticker symbol so each
+            # currency pair gets a distinct, checkable value.
+            value = 1.0 + (sum(ord(c) for c in self.symbol) % 10) / 10
+            return pd.DataFrame({"Close": [value]}, index=pd.to_datetime(["2024-05-10"]))
+
+    with patch.object(rates.yf, "Ticker", FakeTicker):
+        res = client.get("/api/rates", headers={"X-API-Key": key}, params={"base": "usd"})
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["base"] == "USD"
+    assert body["rates"]["USD"] == 1.0
+    assert set(body["rates"]) == set(rates.SUPPORTED_CURRENCIES)
+
+
+def test_rates_rejects_unsupported_base(client):
+    key = _signup(client)
+    res = client.get("/api/rates", headers={"X-API-Key": key}, params={"base": "XYZ"})
+    assert res.status_code == 422
+
+
+def test_rates_502_when_unavailable(client):
+    from webapp.backend import rates
+
+    key = _signup(client)
+
+    class BrokenTicker:
+        def __init__(self, symbol):
+            pass
+
+        def history(self, period):
+            raise RuntimeError("network down")
+
+    with patch.object(rates.yf, "Ticker", BrokenTicker):
+        res = client.get("/api/rates", headers={"X-API-Key": key}, params={"base": "USD"})
+
+    assert res.status_code == 502
+
+
 def test_missing_api_key_rejected(client):
     res = client.get("/api/me")
     assert res.status_code == 422  # missing required header

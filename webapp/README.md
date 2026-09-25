@@ -38,6 +38,15 @@ frontend's "recent prints" list shows which runs were served from cache.
 Beyond the core "analyze a ticker" loop, the app is a small multi-page
 product:
 
+- **Dashboard stats + Market glance** — `GET /api/me` also returns
+  lifetime aggregates (`total_jobs`, `done_jobs`, `cached_jobs`,
+  `distinct_tickers`, `watchlist_count`, via `database.user_stats()`),
+  rendered as four stat cards at the top of the Dashboard (runs this
+  month, total prints, % served from cache, watchlist size — all real
+  numbers, nothing estimated). Below the analyze/print columns, a
+  **Market glance** card shows a live 5-day sparkline, last price and %
+  change for up to 4 watchlist tickers (free — chart data, not an
+  analysis run), each clickable straight into Analyze.
 - **Watchlist** (`GET/POST /api/watchlist`, `DELETE /api/watchlist/{ticker}`)
   — save tickers you check often; "Analyze" on a row jumps to the Dashboard
   with that ticker prefilled.
@@ -47,6 +56,26 @@ product:
   "Upgrade to Pro" action, and self-service API key rotation
   (`POST /api/me/regenerate-key` — the old key stops working immediately,
   for "I think this leaked" moments), plus a device sign-out.
+- **Live price chart** (`GET /api/chart/{ticker}?range=`) — a free closing-
+  price line for whatever ticker is typed into the Analyze form, debounced
+  and fetched straight from yfinance. It costs no LLM tokens and no quota
+  (unlike `/api/analyze`, which runs the full agent pipeline): this is a
+  quick "does this even look interesting" glance before spending a run,
+  not a substitute for the analysis itself. The product's actual output
+  stays a BUY/SELL/HOLD call with the agents' full reasoning — the chart
+  is context around that decision, not a second product.
+- **Preferred currency** (`PATCH /api/me {currency}`) — set on Profile,
+  used across the platform to show a converted price alongside the live
+  chart's USD figure (e.g. "$157.40 ≈ €144.81"), and as the default base
+  on the Rates page below.
+- **Exchange rates** (`GET /api/rates?base=`) — a free, live Xe-style
+  board for a curated set of currencies (USD, EUR, GBP, JPY, AUD, CAD,
+  CHF, CNY, INR, AED, SAR, EGP), fetched from yfinance FX tickers. Same
+  free/no-quota reasoning as the price chart.
+- **Landing page** (signed-out `/`) — a full marketing page: hero, "how
+  it works", a feature grid, **Pricing** (Free vs. Pro, both reflecting
+  real values — the actual `free_tier_monthly_limit()` and Stripe-backed
+  upgrade, no invented numbers) and **FAQ** sections, and a closing CTA.
 
 ## Frontend architecture (`webapp/frontend/`)
 
@@ -66,17 +95,32 @@ static bundle that FastAPI serves directly:
   job is `queued`/`running`, with proper cleanup (a cancelled flag + cleared
   timeout) on unmount or when the job id changes, so a stale poll can never
   set state after the component has moved on.
-- `src/pages/` — `WelcomePage` (signed-out: sign up or paste an existing
-  key), `DashboardPage` (analyze + the decision print), `HistoryPage`,
-  `WatchlistPage`, `ProfilePage`.
+- `src/pages/` — `LandingPage` (signed-out marketing page: hero, "how it
+  works", feature grid, pricing, FAQ, CTA band, all with scroll-reveal
+  animation), `DashboardPage` (analyze + the decision print), `HistoryPage`,
+  `WatchlistPage`, `ProfilePage` (display name, currency, key rotation),
+  `ExchangeRatesPage` (the live rates board).
 - `src/components/` — `Navbar` + `Logo` (an SVG mark, not a raster asset),
-  `SignupPanel`, `SignInPanel`, `AnalyzeForm`, `DecisionStamp` (the hero: a
-  resolved decision renders as a market "print" — ticket id + UTC
-  timestamp, not a generic result card), `ReportView`, `HistoryTape`,
-  `ThemeToggle`.
+  `AuthModal` (sign up / sign in as a dialog, opened from the navbar's
+  "Sign in"/"Get started" buttons or the landing page's CTAs — closes and
+  routes to the Dashboard itself once a key is set, watching
+  `api.apiKey`), `Avatar` + `ProfileMenu` (initials-on-a-color avatar;
+  click opens a dropdown with account info, Profile/Watchlist links, sign
+  out), `SignupPanel`, `SignInPanel`, `AnalyzeForm`, `PriceChart` (a free,
+  debounced closing-price line for whatever ticker is typed — no LLM cost),
+  `DecisionStamp` (the hero: a resolved decision renders as a market
+  "print" — ticket id + UTC timestamp, not a generic result card),
+  `ReportView`, `HistoryTape` (polls live every 12s — no manual refresh
+  button), `MarketGlance` (live watchlist sparklines on the Dashboard),
+  `StatCard`, `QuotaBar`, `ThemeToggle` (icon-only, sun/moon), `Reveal` (a
+  thin `IntersectionObserver` wrapper used for the landing page's
+  scroll-in sections).
 - `src/styles/tokens.css` — the whole design system (colors, type scale,
-  spacing, motion) as CSS custom properties, with a light/dark pair driven
-  by both `prefers-color-scheme` and an explicit `ThemeToggle` override.
+  spacing, motion, elevation) as CSS custom properties, with a light/dark
+  pair driven by both `prefers-color-scheme` and an explicit `ThemeToggle`
+  override. Every animation (hero blobs, the mockup float, scroll-reveal,
+  the modal, the live-tape pulse) is neutralized under
+  `prefers-reduced-motion: reduce`.
 
 Because this is a client-side-routed single-page app, the backend can't
 just serve static files at "/" (`GET /history` would 404 on a hard refresh
@@ -120,12 +164,14 @@ UI and logs a reminder to run `npm run build`.
 | Endpoint | Auth | Purpose |
 |---|---|---|
 | `POST /api/signup` | none | Register an email, get back an API key |
-| `GET /api/me` | API key | Plan, usage, display name, member-since |
-| `PATCH /api/me` | API key | Set `{display_name}` |
+| `GET /api/me` | API key | Plan, usage, display name, currency, member-since, lifetime stats |
+| `PATCH /api/me` | API key | Set `{display_name?, currency?}` — partial update, only provided fields change |
 | `POST /api/me/regenerate-key` | API key | Rotate the API key (old one stops working immediately) |
 | `POST /api/analyze` | API key | Queue an analysis run `{ticker, trade_date?}` → `{job_id}` |
 | `GET /api/jobs/{id}` | API key | Poll job status/result |
 | `GET /api/jobs` | API key | Job history, filterable by `?ticker=&status=&limit=&offset=` |
+| `GET /api/chart/{ticker}` | API key | Free closing-price series, `?range=5d\|1mo\|3mo\|6mo\|1y\|5y` |
+| `GET /api/rates` | API key | Free live exchange-rate board, `?base=USD` (see `rates.SUPPORTED_CURRENCIES`) |
 | `GET /api/watchlist` | API key | List saved tickers |
 | `POST /api/watchlist` | API key | Add `{ticker}` |
 | `DELETE /api/watchlist/{ticker}` | API key | Remove a ticker |

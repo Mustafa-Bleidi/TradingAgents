@@ -110,13 +110,28 @@ export function useTradingApi() {
   );
 
   const updateProfile = useCallback(
-    (displayName) =>
-      request("/api/me", { method: "PATCH", apiKey, body: { display_name: displayName } }),
+    ({ displayName, currency } = {}) =>
+      request("/api/me", {
+        method: "PATCH",
+        apiKey,
+        body: { display_name: displayName, currency },
+      }),
     [apiKey]
   );
 
   const regenerateKey = useCallback(
     () => request("/api/me/regenerate-key", { method: "POST", apiKey }),
+    [apiKey]
+  );
+
+  const fetchChart = useCallback(
+    (ticker, range = "3mo") =>
+      request(`/api/chart/${encodeURIComponent(ticker)}?range=${encodeURIComponent(range)}`, { apiKey }),
+    [apiKey]
+  );
+
+  const fetchRates = useCallback(
+    (base = "USD") => request(`/api/rates?base=${encodeURIComponent(base)}`, { apiKey }),
     [apiKey]
   );
 
@@ -150,6 +165,8 @@ export function useTradingApi() {
       checkout,
       updateProfile,
       regenerateKey,
+      fetchChart,
+      fetchRates,
       fetchWatchlist,
       addWatchlistTicker,
       removeWatchlistTicker,
@@ -167,6 +184,8 @@ export function useTradingApi() {
       checkout,
       updateProfile,
       regenerateKey,
+      fetchChart,
+      fetchRates,
       fetchWatchlist,
       addWatchlistTicker,
       removeWatchlistTicker,
